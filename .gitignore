@@ -1,0 +1,19 @@
+# secrets
+.env
+
+# dataset (downloaded by prepare_data.py, too large for Git)
+data/download/*
+data/landing/*
+!data/download/.gitkeep
+!data/landing/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store
