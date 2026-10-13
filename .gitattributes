@@ -1,5 +1,6 @@
-# shell scripts must keep Unix line endings, also when the repo is cloned on Windows
+# keep Unix line endings for files used inside the Linux containers
 *.sh text eol=lf
-*.env text eol=lf
 *.py text eol=lf
+*.env text eol=lf
 *.yml text eol=lf
+*.conf text eol=lf

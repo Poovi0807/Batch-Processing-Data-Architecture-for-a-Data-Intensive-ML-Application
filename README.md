@@ -1,206 +1,103 @@
 # Batch-processing data architecture for a data-intensive ML application
 
-Portfolio project, Data Engineering (IU) – Phase 2: development.
-
-A local, reproducible batch pipeline that ingests the **BGL supercomputer system log**
-(4,747,963 timestamped log lines, Loghub / Kaggle), stores it in an HDFS data lake, cleans it
-monthly and aggregates hourly machine-learning features quarterly with Apache Spark, and
-delivers them to a PostgreSQL database for an ML application. Apache Airflow orchestrates
-everything. Every component runs as its own Docker container, defined as code in
-[`docker-compose.yml`](docker-compose.yml).
+Portfolio project, Data Engineering (IU). A batch pipeline that takes the **BGL supercomputer log**
+(4,747,963 timestamped lines, Loghub / Kaggle), stores it in **HDFS**, cleans it monthly and builds
+hourly machine-learning features quarterly with **Spark**, and delivers them to **PostgreSQL**.
+**Airflow** runs the steps. Every part runs in its own **Docker** container (`docker-compose.yml`).
 
 ![Architecture](docs/architecture.png)
 
-## Services
+## Where the data goes
 
-| Stage | Container(s) | Image | Purpose |
-|---|---|---|---|
-| Ingestion | `ingest` | `python:3.12-slim` + own code | Validates the monthly log file (format, checksum) and uploads it unchanged to HDFS via WebHDFS |
-| Storage | `hdfs-namenode`, `hdfs-datanode-1`, `hdfs-datanode-2`, `hdfs-init` | `apache/hadoop:3.4.3` (+ data dir) | Data lake with three zones: `/data/raw`, `/data/processed`, `/data/curated`; replication factor 2 |
-| Processing | `spark-master`, `spark-worker-1`, `spark-worker-2`, `spark-gateway` | `spark:4.2.0-python3` + JDBC driver + jobs | Monthly parsing/cleaning, quarterly aggregation; the gateway runs `spark-submit` on request |
-| Delivery | `serving-db` | `postgres:17` + init script | Feature table `features.midplane_hourly`, read-only user `ml_reader`, audit table |
-| Orchestration | `airflow-apiserver`, `airflow-scheduler`, `airflow-dag-processor`, `airflow-init`, `airflow-db` | `apache/airflow:3.3.2`, `postgres:17` | Two DAGs: `monthly_ingest_clean`, `quarterly_aggregate_deliver` |
+| Station | Where | Written by |
+|---|---|---|
+| ① Landing folder | `data/landing/bgl_2005-06.log` … (one file per month) | `ingest/prepare_data.py` (once) |
+| ② HDFS raw | `/data/raw/bgl/month=2005-06/` (unchanged copy) | `ingest/ingest_service.py` |
+| ③ HDFS processed | `/data/processed/bgl/month=2005-06/` (clean table, Parquet) | `spark/jobs/clean_month.py` |
+| ④ HDFS curated | `/data/curated/features/quarter=2005Q3/` (features, Parquet) | `spark/jobs/build_features.py` |
+| ⑤ PostgreSQL | table `features.midplane_hourly` (read by the ML application) | `spark/jobs/build_features.py` |
 
-Web interfaces (only reachable from your own machine):
+Airflow (`airflow/dags/bgl_pipeline.py`) starts the steps: **monthly** ingest → clean,
+**quarterly** wait → delete old rows → build features → check delivery.
+Every step writes one line into the audit table `governance.pipeline_runs`.
 
-| URL | What |
-|---|---|
-| http://localhost:8080 | Airflow (login from your `.env`) |
-| http://localhost:9870 | HDFS NameNode (Utilities → Browse the file system) |
-| http://localhost:8090 | Spark master (workers, running and completed jobs) |
-| `localhost:5433` | Serving database (PostgreSQL) for the ML application |
+## How to run (Windows PowerShell, Mac or Linux)
 
-## Requirements
-
-* **Docker Desktop** (Windows, macOS) or Docker Engine with the Compose plugin (Linux).
-* **Memory:** give Docker at least **8 GB RAM** (Docker Desktop → Settings → Resources).
-  With 16 GB or more on your laptop, the default settings work. With 8 GB in total, set
-  `SPARK_WORKER_MEMORY=1g` and `SPARK_EXECUTOR_MEMORY=768m` in `.env`.
-* About 5 GB of free disk space (images + data).
-* Internet access for the first build and for the dataset download (~58 MB zipped).
-
-## Quick start
-
-All commands are run in the project folder (PowerShell, Terminal or Git Bash).
-
-**1. Create the secrets file `.env`** (random passwords, never committed to Git)
+You need **Docker Desktop** with at least 8 GB memory. Run the commands in the project folder.
 
 ```bash
-python scripts/generate_env.py
-```
+# 1. passwords file (once)
+copy .env.example .env               # Mac/Linux: cp .env.example .env
 
-No Python on your computer? Copy `.env.example` to `.env` and replace every `change-me` by
-your own value (the Fernet key must be 44 characters of URL-safe base64; you can also leave it
-empty for a local test).
-
-**2. Build the images**
-
-```bash
+# 2. build the images (once, about 5 minutes)
 docker compose build
-```
 
-**3. Download the dataset and split it into monthly landing files** (one-off)
+# 3. download the dataset and split it into monthly files (once)
+docker compose run --rm ingest python prepare_data.py
 
-```bash
-docker compose run --rm --no-deps ingest python prepare_data.py
-```
-
-This downloads the BGL log from Kaggle if `KAGGLE_USERNAME`/`KAGGLE_KEY` are set in `.env`,
-otherwise the identical original archive from Zenodo, and writes 8 files
-`data/landing/bgl_2005-06.log` … `bgl_2006-01.log`. This simulates one log delivery per month.
-
-**4. Start the system**
-
-```bash
+# 4. start everything – Airflow then runs the whole pipeline by itself
 docker compose up -d
-docker compose ps
 ```
 
-Wait until all long-running services show `healthy` (2–3 minutes on the first start).
-`hdfs-init` and `airflow-init` are one-off jobs and show `exited (0)`.
+Then open **http://localhost:8501** (dashboard) and watch the numbers go to 8 / 8 and 4 / 4
+(about 20–60 minutes). Airflow is at **http://localhost:8080** (no login needed).
 
-**5. Unpause the DAGs** – open http://localhost:8080, log in, switch both DAGs on.
+If step 3 cannot download the file, open
+https://zenodo.org/records/8196385/files/BGL.zip?download=1 in your browser, save the file in
+the folder `data/download` and run step 3 again.
 
-**6. Replay the history with an Airflow backfill**
+## Useful commands
 
-```bash
-docker compose exec airflow-scheduler airflow backfill create --dag-id monthly_ingest_clean --from-date 2005-06-01 --to-date 2006-01-01 --max-active-runs 1
-docker compose exec airflow-scheduler airflow backfill create --dag-id quarterly_aggregate_deliver --from-date 2005-04-01 --to-date 2006-01-01 --max-active-runs 1
-```
-
-(Alternatively, in the Airflow UI: open the DAG → *Trigger* → *Backfill* with the same dates.)
-
-This creates 8 monthly runs (June 2005 – January 2006) and 4 quarterly runs (2005Q2 – 2006Q1).
-The quarterly runs wait automatically until all months of their quarter are cleaned.
-The automatic run for the current month is *skipped*, because the dataset contains no log
-file for it – this is expected.
-
-**7. Check the result**
-
-```bash
-# feature table, read as the ML application would (read-only user)
-docker compose exec serving-db psql -U ml_reader -d serving -c "SELECT quarter, count(*) AS rows, count(DISTINCT midplane) AS midplanes, count(*) FILTER (WHERE alert_next_hour) AS positive_labels FROM features.midplane_hourly GROUP BY quarter ORDER BY quarter;"
-
-# audit trail (lineage, row counts, checksums)
-docker compose exec serving-db psql -U serving_admin -d serving -c "SELECT stage, partition_key, rows_in, rows_out, rows_rejected, status, left(checksum_sha256, 12) FROM governance.pipeline_runs ORDER BY id;"
-
-# data lake zones
-docker compose exec hdfs-namenode hdfs dfs -du -h /data/raw/bgl /data/processed/bgl /data/curated/bgl_features
-```
-
-## Pipeline details
-
-**Monthly DAG `monthly_ingest_clean`** (data interval = one month)
-
-1. `ingest_raw` – the ingest service checks the landing file (name, line format, month of every
-   line), computes a SHA-256 checksum, rejects the file if more than 1 % of the lines are
-   malformed, and uploads it unchanged to `/data/raw/bgl/year=YYYY/month=MM/`.
-2. `parse_clean` – Spark job `parse_clean_month.py`: removes duplicate lines, parses the ten
-   fields, converts the Unix time to UTC, derives rack and midplane from the node ID, masks IP
-   addresses, e-mail addresses and user names (`<IP>`, `<EMAIL>`, `<USER>`), builds a message
-   template, stops if the malformed share is too high (data-quality gate) and writes Snappy
-   Parquet to `/data/processed/bgl/year=YYYY/month=MM/`.
-
-**Quarterly DAG `quarterly_aggregate_deliver`**
-
-1. `wait_for_cleaned_months` – sensor (reschedule mode) until every month of the quarter is cleaned.
-2. `aggregate_and_deliver` – Spark job `aggregate_quarter.py`: one row per midplane and hour with
-   event counts per severity and component, distinct templates and nodes, alert count and the
-   label `alert_next_hour`; written to `/data/curated/bgl_features/quarter=YYYYQn/` and loaded
-   into `features.midplane_hourly` (old rows of the quarter are replaced).
-3. `verify_delivery` – connects as `ml_reader` and checks that the quarter can be read.
-
-**Re-run a single month or quarter:** in the Airflow UI click *Trigger* on the DAG and set the
-parameter `month` (e.g. `2005-07`) or `quarter` (e.g. `2005Q3`). Every job overwrites exactly
-its own partition, so re-runs never duplicate data.
-
-## Reliability, scalability, maintainability
-
-* HDFS replication factor 2 (losing one DataNode loses no data); immutable raw zone.
-* Idempotent jobs (overwrite one partition), Airflow retries, data-quality gates.
-* Health checks, `restart: unless-stopped`, start order via `depends_on` conditions.
-* Named Docker volumes for HDFS, both databases and the Airflow logs.
-* Scale out by adding a `spark-worker-3` or `hdfs-datanode-3` block to `docker-compose.yml`.
-* Pinned image and library versions; configuration in `.env` and `hdfs/hadoop.env`.
-
-## Security, governance, protection
-
-* One private Docker network; only the four web/database ports are published, and only on `127.0.0.1`.
-* Secrets only in `.env` (git-ignored); generated randomly by `scripts/generate_env.py`.
-* HDFS permissions on: the data-lake zones belong to the technical user `etl` (mode 750).
-* PostgreSQL least privilege: `etl_writer` (write features and audit records), `ml_reader`
-  (read-only, feature schema only, no access to `governance`).
-* The Spark gateway only accepts the two known job names with integer arguments.
-* Containers run as non-root users (`hadoop`, `spark`, `ingest`, `airflow`).
-* Audit table `governance.pipeline_runs` records every load, cleaning and delivery step.
-* Personal and network data (IP, e-mail, user names) is masked before it leaves the raw zone.
-
-## Tests
-
-Unit tests of the Spark transformations (parsing, deduplication, masking, features, label):
-
-```bash
-docker compose run --rm --no-deps spark-gateway /opt/spark/bin/spark-submit /opt/pipeline/tests/test_transform.py
-```
-
-## Stop, restart, reset
-
-```bash
-docker compose stop          # stop, keep all data
-docker compose up -d         # start again
-docker compose down -v       # remove containers AND all data volumes (full reset)
-```
-
-## Troubleshooting
-
-| Problem | Fix |
+| Command | What it does |
 |---|---|
-| Containers restart or Spark jobs fail with "out of memory" | Increase Docker memory, or lower `SPARK_WORKER_MEMORY` / `SPARK_EXECUTOR_MEMORY` in `.env`, then `docker compose up -d` |
-| A port is already in use | Change the left-hand port in `docker-compose.yml`, e.g. `"127.0.0.1:8081:8080"` |
-| Linux: `prepare_data.py` cannot write to `data/` | `sudo chown -R 1000:1000 data` (the ingest container runs as user 1000) |
-| A task failed | Airflow UI → DAG → failed task → *Logs*; Spark job output is included in the task log |
-| Start again from zero | `docker compose down -v`, then step 4 |
+| `docker compose ps` | Shows all containers and whether they are healthy |
+| `docker compose logs -f airflow` | Shows what Airflow is doing |
+| `docker compose stop` | Stops everything, keeps all data |
+| `docker compose down -v` | Deletes everything (containers and data) for a fresh start |
+| `docker compose exec spark-gateway /opt/spark/bin/spark-submit /opt/tests/test_transform.py` | Runs the unit tests |
+| `docker compose exec serving-db psql -U ml_reader -d serving -c "SELECT quarter, count(*) FROM features.midplane_hourly GROUP BY quarter"` | Reads the features like the ML application |
 
-## Project structure
+**Coming from the old version?** Run `docker compose down -v --remove-orphans` once before step 4.
+
+## Web pages (only reachable from your own computer)
+
+| Address | What you see |
+|---|---|
+| http://localhost:8501 | Dashboard: where is my data? |
+| http://localhost:8080 | Airflow: pipelines, runs, logs |
+| http://localhost:9870 | HDFS: Utilities → Browse the file system → `/data` |
+| http://localhost:8090 | Spark: workers and finished jobs |
+
+## Project files
 
 ```
-├── docker-compose.yml          all services, networks, volumes (Infrastructure as Code)
-├── .env.example                configuration template (copy to .env)
-├── hdfs/                       Hadoop image extension + configuration
-├── ingest/app/                 ingestion service, data preparation, BGL format
-├── spark/gateway/              job gateway (HTTP -> spark-submit)
-├── spark/jobs/                 Spark jobs and transformations
-├── spark/tests/                unit tests
-├── airflow/dags/               monthly and quarterly DAGs + shared helpers
-├── postgres/serving-init/      schemas, tables, users and privileges
-├── scripts/generate_env.py     creates .env with random secrets
-├── data/landing, data/download dataset (not in Git)
-└── docs/                       architecture diagram, screenshots
+docker-compose.yml          all 13 containers (Infrastructure as Code)
+.env.example                passwords template (copy to .env, never uploaded to Git)
+hdfs/                       HDFS settings (2 copies of every block, permissions)
+ingest/prepare_data.py      step 0: download + split into monthly files
+ingest/ingest_service.py    copies a monthly file into HDFS
+spark/gateway.py            starts a Spark job when Airflow asks
+spark/jobs/transform.py     the cleaning and feature logic
+spark/jobs/clean_month.py   monthly job:   raw -> processed
+spark/jobs/build_features.py quarterly job: processed -> curated + PostgreSQL
+spark/tests/                unit tests
+airflow/dags/bgl_pipeline.py the two pipelines
+postgres/init.sh            tables and users of the serving database
+dashboard/app.py            the dashboard
 ```
+
+## Reliability, security and governance (short)
+
+* HDFS keeps 2 copies of every block; the raw zone is never changed; every job overwrites only its
+  own month or quarter, so repeating it is safe; Airflow retries failed steps twice.
+* Files with more than 1 % broken lines are rejected (ingest and Spark).
+* Private Docker network; web pages only on 127.0.0.1; passwords only in `.env`;
+  `ml_reader` may only read the features; HDFS zones belong to user `etl` (mode 750).
+* IP addresses, e-mail addresses and user names are masked before data leaves the raw zone.
+* Audit table `governance.pipeline_runs` records every step.
 
 ## Data source
 
 Zhu, J., He, S., He, P., Liu, J., & Lyu, M. R. (2023). Loghub: A large collection of system log
-datasets for AI-driven log analytics. *IEEE ISSRE*. Dataset on Kaggle:
-[LogHub – BGL Log Data](https://www.kaggle.com/datasets/omduggineni/loghub-bgl-log-data);
-original archive: [Zenodo record 8196385](https://zenodo.org/records/8196385). Free for research purposes.
+datasets for AI-driven log analytics. *IEEE ISSRE*. Kaggle: LogHub – BGL Log Data; original
+archive: Zenodo record 8196385.
