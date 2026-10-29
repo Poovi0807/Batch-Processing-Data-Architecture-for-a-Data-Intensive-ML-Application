@@ -28,11 +28,17 @@ landing folder ──► ingest ──► HDFS raw ──► Spark clean ──�
 Needs Docker with at least 8 GB of memory and Python 3.10+.
 
 ```bash
-git clone <this repository> && cd bgl-batch-pipeline
-cp .env.example .env                      # then change every password in .env
-python scripts/split_by_month.py path/to/BGL.log   # writes data/landing/BGL_YYYY-MM.log
-docker compose up -d --build              # first start takes a few minutes
+git clone https://github.com/Poovi0807/Batch-Processing-Data-Architecture-for-a-Data-Intensive-ML-Application.git
+cd Batch-Processing-Data-Architecture-for-a-Data-Intensive-ML-Application
+notepad .env                              # create .env with your passwords
+bash scripts/download_data.sh             # Windows: powershell -ExecutionPolicy Bypass -File scripts\download_data.ps1
+docker compose up -d --build              # first start takes 10-20 minutes
 ```
+
+The download script fetches `BGL.zip` (57.5 MB) from the official Loghub record on
+[Zenodo](https://zenodo.org/records/8196385) and splits it into
+`data/landing/BGL_2005-06.log` … `BGL_2006-01.log` (4,747,963 lines in total).
+If you already have `BGL.log`, run `python scripts/split_by_month.py path/to/BGL.log` instead.
 
 1. Open Airflow at <http://localhost:8080> and log in with the admin user from `.env`.
 2. Switch on the DAG **bgl_monthly_ingest_clean**. Airflow replays all eight months and
@@ -41,8 +47,19 @@ docker compose up -d --build              # first start takes a few minutes
 
 Stop with `docker compose down` (data is kept) or `docker compose down -v` (everything deleted).
 
-The dataset is on Kaggle as `omduggineni/loghub-bgl-log-data`
-(`scripts/download_data.sh` downloads and splits it if you have a Kaggle API key).
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| A container stops with exit code 137 | Give Docker at least 8 GB of memory |
+| `port is already allocated` | Another program uses the port: stop it, or change the left number in `ports:` |
+| The downloaded zip is empty (a few bytes) | Download again; the script stops with a message if this happens |
+| Strange file errors inside a OneDrive folder | Pause OneDrive sync, or keep the project outside OneDrive (e.g. `C:\bgl`) |
+| Airflow login fails after changing `.env` | The admin user is created once: `docker compose down -v`, then start again |
+| `ingest` task fails with 404 / 409 | Monthly file missing / a different file for an already ingested month (intended protection) |
+
+Every push runs the unit tests and checks `docker-compose.yml` with GitHub Actions
+(`.github/workflows/ci.yml`).
 
 ## Web interfaces
 
