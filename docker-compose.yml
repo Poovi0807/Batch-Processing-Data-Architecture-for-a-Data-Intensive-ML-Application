@@ -1,0 +1,283 @@
+# BGL batch pipeline - the whole system as code.
+# Start:  docker compose up -d --build        Stop:  docker compose down
+#
+# Networks
+#   backend   internal only, no internet, no ports: every service talks here
+#   frontend  only the user interfaces and the serving database, on localhost
+name: bgl-pipeline
+
+x-airflow-env: &airflow-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@airflow-db:5432/airflow
+  AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+  AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_SECRET_KEY}
+  AIRFLOW__API__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+  AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+  PYTHONPATH: /opt/airflow            # makes the folder 'jobs' importable
+  # Settings read by jobs/tasks.py
+  SPARK_REMOTE: sc://spark-connect:15002
+  LAKE_BASE: hdfs://namenode:8020/bgl
+  INGEST_URL: http://ingest:8000
+  SERVING_DB_DSN: host=serving-db dbname=serving user=pipeline_writer password=${PIPELINE_WRITER_PASSWORD}
+
+x-airflow-common: &airflow-common
+  build: ./airflow
+  image: bgl/airflow:1.0
+  environment: *airflow-env
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags:ro
+    - ./jobs:/opt/airflow/jobs:ro
+    - airflow-logs:/opt/airflow/logs
+  networks: [backend]
+  restart: unless-stopped
+
+x-hadoop: &hadoop
+  image: apache/hadoop:3.4.3
+  env_file: ./hadoop/hadoop.env
+  networks: [backend]
+  restart: unless-stopped
+
+x-spark: &spark
+  image: spark:4.2.0-python3
+  networks: [backend]
+  restart: unless-stopped
+
+services:
+
+  # ---------------- storage: HDFS ----------------
+  namenode:
+    <<: *hadoop
+    hostname: namenode
+    # Give the volume to the 'hadoop' user, format the NameNode on the first start only, then run it
+    command:
+      - bash
+      - -c
+      - sudo chown hadoop:users /data && { [ -d /data/namenode ] || hdfs namenode -format -force -nonInteractive; } && exec hdfs namenode
+    ports: ["127.0.0.1:9870:9870"]            # NameNode web UI
+    volumes: [namenode-data:/data]
+    networks: [backend, frontend]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/9870"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  datanode-1:
+    <<: *hadoop
+    hostname: datanode-1
+    command: ["bash", "-c", "sudo chown hadoop:users /data && exec hdfs datanode"]
+    volumes: [datanode1-data:/data]
+    depends_on:
+      namenode: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/9864"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  datanode-2:
+    <<: *hadoop
+    hostname: datanode-2
+    command: ["bash", "-c", "sudo chown hadoop:users /data && exec hdfs datanode"]
+    volumes: [datanode2-data:/data]
+    depends_on:
+      namenode: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/9864"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  hdfs-init:                                  # one-off job: create the lake zones
+    <<: *hadoop
+    command: ["bash", "/scripts/init_hdfs.sh"]
+    volumes: ["./hadoop/init_hdfs.sh:/scripts/init_hdfs.sh:ro"]
+    restart: "no"
+    depends_on:
+      datanode-1: {condition: service_healthy}
+      datanode-2: {condition: service_healthy}
+
+  # ---------------- processing: Spark ----------------
+  spark-master:
+    <<: *spark
+    hostname: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    ports: ["127.0.0.1:8081:8080"]            # Spark master web UI
+    networks: [backend, frontend]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  spark-worker-1: &spark-worker
+    <<: *spark
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: 1g
+    depends_on:
+      spark-master: {condition: service_healthy}
+
+  spark-worker-2: *spark-worker               # more workers = copy this line
+
+  spark-connect:                              # the endpoint Airflow sends Spark jobs to
+    <<: *spark
+    hostname: spark-connect
+    command:
+      - /opt/spark/sbin/start-connect-server.sh
+      - --master
+      - spark://spark-master:7077
+      - --conf
+      - spark.executor.memory=768m
+      - --conf
+      - spark.sql.session.timeZone=UTC
+      - --conf
+      - spark.hadoop.fs.defaultFS=hdfs://namenode:8020
+      - --conf
+      - spark.hadoop.dfs.replication=2
+    environment:
+      SPARK_NO_DAEMONIZE: "true"              # keep the server in the foreground
+      HADOOP_USER_NAME: pipeline              # owner of the lake zones in HDFS
+    depends_on:
+      spark-master: {condition: service_healthy}
+      hdfs-init: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/15002"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # ---------------- delivery: serving database ----------------
+  serving-db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: serving
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${SERVING_DB_ADMIN_PASSWORD}
+      PIPELINE_WRITER_PASSWORD: ${PIPELINE_WRITER_PASSWORD}
+      ML_READER_PASSWORD: ${ML_READER_PASSWORD}
+      DASHBOARD_READER_PASSWORD: ${DASHBOARD_READER_PASSWORD}
+    volumes:
+      - serving-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    ports: ["127.0.0.1:5433:5432"]            # for the ML application
+    networks: [backend, frontend]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d serving"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---------------- ingestion ----------------
+  ingest:
+    build: ./ingest
+    image: bgl/ingest:1.0
+    environment:
+      LANDING_DIR: /landing
+      HDFS_URL: http://namenode:9870
+      HDFS_USER: pipeline
+      RAW_BASE: /bgl/raw
+      SERVING_DB_DSN: host=serving-db dbname=serving user=pipeline_writer password=${PIPELINE_WRITER_PASSWORD}
+    volumes: ["./data/landing:/landing:ro"]   # read-only: ingestion never changes the source
+    networks: [backend]
+    restart: unless-stopped
+    depends_on:
+      hdfs-init: {condition: service_completed_successfully}
+      serving-db: {condition: service_healthy}
+
+  # ---------------- orchestration: Airflow ----------------
+  airflow-db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+    volumes: [airflow-db-data:/var/lib/postgresql/data]
+    networks: [backend]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  airflow-init:                               # one-off job: create tables and the admin user
+    <<: *airflow-common
+    command: ["version"]
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+    restart: "no"
+    depends_on:
+      airflow-db: {condition: service_healthy}
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: ["api-server"]
+    ports: ["127.0.0.1:8080:8080"]            # Airflow web UI
+    networks: [backend, frontend]
+    depends_on:
+      airflow-init: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8080/api/v2/version"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: ["scheduler"]
+    depends_on:
+      airflow-init: {condition: service_completed_successfully}
+      airflow-apiserver: {condition: service_healthy}
+      spark-connect: {condition: service_healthy}
+      ingest: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8974/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: ["dag-processor"]
+    depends_on:
+      airflow-init: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type DagProcessorJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 20s
+      retries: 10
+
+  # ---------------- user interface ----------------
+  dashboard:
+    build: ./dashboard
+    image: bgl/dashboard:1.0
+    environment:
+      DASHBOARD_DB_DSN: host=serving-db dbname=serving user=dashboard_reader password=${DASHBOARD_READER_PASSWORD}
+    ports: ["127.0.0.1:8501:8501"]
+    networks: [backend, frontend]
+    restart: unless-stopped
+    depends_on:
+      serving-db: {condition: service_healthy}
+
+networks:
+  backend:
+    internal: true        # no internet access and no published ports
+  frontend: {}
+
+volumes:
+  namenode-data:
+  datanode1-data:
+  datanode2-data:
+  serving-data:
+  airflow-db-data:
+  airflow-logs:

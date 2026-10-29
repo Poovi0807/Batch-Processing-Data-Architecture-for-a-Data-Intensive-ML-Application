@@ -1,0 +1,15 @@
+# secrets
+.env
+
+# data never goes to Git (too big; downloaded by a script)
+data/landing/*
+!data/landing/.gitkeep
+data/download/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+spark-warehouse/
+metastore_db/
